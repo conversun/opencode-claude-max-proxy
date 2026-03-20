@@ -74,6 +74,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         const model = mapModelToClaudeModel(body.model || "sonnet")
         const stream = body.stream ?? true
 
+        // Debug: log request details
+        const msgSummary = body.messages?.map((m: any) => {
+          const contentTypes = Array.isArray(m.content)
+            ? m.content.map((b: any) => b.type).join(",")
+            : "string"
+          return `${m.role}[${contentTypes}]`
+        }).join(" → ")
+        console.error(`[PROXY] ${requestMeta.requestId} model=${model} stream=${stream} tools=${body.tools?.length ?? 0} msgs=${msgSummary}`)
+
         claudeLog("request.received", {
           model,
           stream,
