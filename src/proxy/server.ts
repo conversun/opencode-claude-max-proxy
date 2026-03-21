@@ -7,10 +7,11 @@ import type { Context } from "hono"
 import type { ProxyConfig } from "./types"
 import { DEFAULT_PROXY_CONFIG } from "./types"
 import { claudeLog } from "../logger"
-import { execSync } from "child_process"
+import { exec as execCallback } from "child_process"
 import { existsSync } from "fs"
 import { fileURLToPath } from "url"
 import { join, dirname } from "path"
+import { promisify } from "util"
 import { opencodeMcpServer } from "../mcpTools"
 import { randomUUID, createHash } from "crypto"
 import { withClaudeLogContext } from "../logger"
@@ -268,24 +269,46 @@ const ALLOWED_MCP_TOOLS = [
   `mcp__${MCP_SERVER_NAME}__grep`
 ]
 
-function resolveClaudeExecutable(): string {
-  // 1. Try the SDK's bundled cli.js (same dir as this module's SDK)
-  try {
-    const sdkPath = fileURLToPath(import.meta.resolve("@anthropic-ai/claude-agent-sdk"))
-    const sdkCliJs = join(dirname(sdkPath), "cli.js")
-    if (existsSync(sdkCliJs)) return sdkCliJs
-  } catch {}
+const exec = promisify(execCallback)
 
-  // 2. Try the system-installed claude binary
-  try {
-    const claudePath = execSync("which claude", { encoding: "utf-8" }).trim()
-    if (claudePath && existsSync(claudePath)) return claudePath
-  } catch {}
+let cachedClaudePath: string | null = null
+let cachedClaudePathPromise: Promise<string> | null = null
+let claudeExecutable = ""
 
-  throw new Error("Could not find Claude Code executable. Install via: npm install -g @anthropic-ai/claude-code")
+async function resolveClaudeExecutableAsync(): Promise<string> {
+  if (cachedClaudePath) return cachedClaudePath
+  if (cachedClaudePathPromise) return cachedClaudePathPromise
+
+  cachedClaudePathPromise = (async () => {
+    // 1. Try the SDK's bundled cli.js (same dir as this module's SDK)
+    try {
+      const sdkPath = fileURLToPath(import.meta.resolve("@anthropic-ai/claude-agent-sdk"))
+      const sdkCliJs = join(dirname(sdkPath), "cli.js")
+      if (existsSync(sdkCliJs)) {
+        cachedClaudePath = sdkCliJs
+        return sdkCliJs
+      }
+    } catch {}
+
+    // 2. Try the system-installed claude binary
+    try {
+      const { stdout } = await exec("which claude")
+      const claudePath = stdout.trim()
+      if (claudePath && existsSync(claudePath)) {
+        cachedClaudePath = claudePath
+        return claudePath
+      }
+    } catch {}
+
+    throw new Error("Could not find Claude Code executable. Install via: npm install -g @anthropic-ai/claude-code")
+  })()
+
+  try {
+    return await cachedClaudePathPromise
+  } finally {
+    cachedClaudePathPromise = null
+  }
 }
-
-const claudeExecutable = resolveClaudeExecutable()
 
 function mapModelToClaudeModel(model: string): "sonnet" | "opus" | "haiku" {
   if (model.includes("opus")) return "opus"
@@ -1110,10 +1133,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   app.post("/messages", (c) => handleWithQueue(c, "/messages"))
 
   // Health check endpoint — verifies auth status
-  app.get("/health", (c) => {
+  app.get("/health", async (c) => {
     try {
-      const authJson = execSync("claude auth status", { encoding: "utf-8", timeout: 5000 })
-      const auth = JSON.parse(authJson)
+      const { stdout } = await exec("claude auth status", { timeout: 5000 })
+      const auth = JSON.parse(stdout)
       if (!auth.loggedIn) {
         return c.json({
           status: "unhealthy",
@@ -1149,6 +1172,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 }
 
 export async function startProxyServer(config: Partial<ProxyConfig> = {}) {
+  claudeExecutable = await resolveClaudeExecutableAsync()
   const { app, config: finalConfig } = createProxyServer(config)
 
   const server = serve({
